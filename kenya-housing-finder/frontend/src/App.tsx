@@ -77,6 +77,7 @@ function App() {
   const [scrapingProgress, setScrapingProgress] = useState<number>(0)
   const [scrapingMessage, setScrapingMessage] = useState<string>('')
   const [scrapingErrors, setScrapingErrors] = useState<string[]>([])
+  const [apiKey, setApiKey] = useState<string>('')
   const wsRef = useRef<WebSocket | null>(null)
   const [mapCenter, setMapCenter] = useState<LatLngExpression>([-1.2921, 36.8219])
   const [mapZoom, setMapZoom] = useState<number>(7)
@@ -250,7 +251,8 @@ function App() {
           min_budget: minBudget[0],
           max_budget: maxBudget[0],
           property_type: propertyType,
-          bedrooms: bedrooms === 'any' ? null : parseInt(bedrooms)
+          bedrooms: bedrooms === 'any' ? null : parseInt(bedrooms),
+          api_key: apiKey.trim() || null
         }),
       })
 
@@ -498,9 +500,24 @@ function App() {
                             </Select>
                           </div>
 
+                          <div className="space-y-3">
+                            <Label htmlFor="api-key">OpenAI API Key (Required for AI Scraping)</Label>
+                            <Input
+                              id="api-key"
+                              type="password"
+                              placeholder="sk-..."
+                              value={apiKey}
+                              onChange={(e) => setApiKey(e.target.value)}
+                              className="w-full"
+                            />
+                            <p className="text-xs text-gray-500">
+                              Your API key is only used for this session and not stored.
+                            </p>
+                          </div>
+
                           <Button 
                             onClick={scrapeHousingListingsAI} 
-                            disabled={isScrapingListings} 
+                            disabled={isScrapingListings || !apiKey.trim()} 
                             className="w-full"
                           >
                             {isScrapingListings ? (

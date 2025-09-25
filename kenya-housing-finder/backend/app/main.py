@@ -14,6 +14,19 @@ from bs4 import BeautifulSoup
 import re
 from playwright.async_api import async_playwright
 from fake_useragent import UserAgent
+import os
+from dotenv import load_dotenv
+from crawl4ai import AsyncWebCrawler
+from crawl4ai.extraction_strategy import LLMExtractionStrategy
+import openai
+
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+MAX_LISTINGS_PER_SITE = int(os.getenv("MAX_LISTINGS_PER_SITE", "20"))
+SCRAPING_TIMEOUT = int(os.getenv("SCRAPING_TIMEOUT", "30"))
 
 app = FastAPI(title="Kenya Housing Location Finder API")
 
@@ -61,6 +74,7 @@ class HousingListingRequest(BaseModel):
     max_budget: Optional[int] = None
     property_type: Optional[str] = "any"  # apartment, house, studio, any
     bedrooms: Optional[int] = None
+    api_key: Optional[str] = None
 
 class HousingListing(BaseModel):
     title: str
@@ -239,17 +253,151 @@ async def suggest_areas(request: CommuteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Area suggestion failed: {str(e)}")
 
-async def ai_scrape_housing_site(site_url: str, area: str, websocket: WebSocket = None) -> List[HousingListing]:
-    """Enhanced scraping using Playwright + BeautifulSoup with intelligent extraction"""
+async def ai_scrape_housing_site(site_url: str, area: str, api_key: Optional[str] = None, websocket: WebSocket = None) -> List[HousingListing]:
+    """AI-powered scraping using Crawl4AI with user-configurable API keys"""
     listings = []
     
     if websocket:
         await websocket.send_text(json.dumps({
             "type": "progress",
-            "message": f"Starting enhanced scraping for {area}...",
+            "message": f"Starting AI-powered scraping for {area}...",
             "site": site_url,
             "progress": 10
         }))
+    
+    try:
+        effective_api_key = api_key or OPENAI_API_KEY
+        if not effective_api_key and not USE_LOCAL_LLM:
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "No AI API key provided. Please enter your OpenAI API key."
+                }))
+            return await scrape_buyrentkenya_fallback(area)
+        
+        if websocket:
+            await websocket.send_text(json.dumps({
+                "type": "progress", 
+                "message": f"Initializing AI crawler for {area}...",
+                "progress": 20
+            }))
+        
+        extraction_strategy = LLMExtractionStrategy(
+            provider="openai/gpt-4o-mini" if not USE_LOCAL_LLM else "ollama/llama3.2",
+            api_token=effective_api_key if not USE_LOCAL_LLM else None,
+            base_url=None if not USE_LOCAL_LLM else OLLAMA_BASE_URL,
+            instruction=f"""
+            Extract housing rental listings from this webpage for the area {area} in Kenya. 
+            For each property listing found, extract the following information:
+            
+            - title: Property title or name
+            - price: Monthly rental price in KSh (extract numbers only, convert to integer)
+            - location: Specific location or neighborhood 
+            - bedrooms: Number of bedrooms (extract number)
+            - property_type: Type of property (apartment, house, studio, villa, etc.)
+            - description: Brief property description
+            - contact: Phone number or email if available
+            - url: Link to the full listing
+            
+            Return the data as a JSON array of objects. Only include actual rental properties, ignore ads or non-rental content.
+            Focus on properties in or near {area}.
+            """,
+            schema={
+                "type": "object",
+                "properties": {
+                    "listings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "price": {"type": "string"},
+                                "location": {"type": "string"},
+                                "bedrooms": {"type": "string"},
+                                "property_type": {"type": "string"},
+                                "description": {"type": "string"},
+                                "contact": {"type": "string"},
+                                "url": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        
+        if websocket:
+            await websocket.send_text(json.dumps({
+                "type": "progress", 
+                "message": f"AI analyzing webpage content for {area}...",
+                "progress": 50
+            }))
+        
+        async with AsyncWebCrawler(verbose=False) as crawler:
+            result = await crawler.arun(
+                url=site_url,
+                extraction_strategy=extraction_strategy,
+                bypass_cache=True,
+                timeout=SCRAPING_TIMEOUT
+            )
+            
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "progress", 
+                    "message": f"Processing AI extraction results for {area}...",
+                    "progress": 80
+                }))
+            
+            if result.extracted_content:
+                try:
+                    extracted_data = json.loads(result.extracted_content)
+                    raw_listings = extracted_data.get('listings', [])
+                    
+                    for item in raw_listings[:MAX_LISTINGS_PER_SITE]:
+                        if isinstance(item, dict):
+                            listing = HousingListing(
+                                title=item.get('title', 'No title'),
+                                price=extract_price(str(item.get('price', 0))),
+                                location=item.get('location', area),
+                                area=area,
+                                bedrooms=extract_bedrooms(str(item.get('bedrooms', ''))),
+                                property_type=item.get('property_type', 'apartment').lower(),
+                                description=item.get('description', 'No description')[:200],
+                                contact=item.get('contact'),
+                                url=item.get('url', ''),
+                                source="AI-Powered Crawl4AI",
+                                images=[]
+                            )
+                            listings.append(listing)
+                            
+                except json.JSONDecodeError:
+                    if websocket:
+                        await websocket.send_text(json.dumps({
+                            "type": "progress",
+                            "message": f"AI extraction failed, using fallback for {area}...",
+                            "progress": 85
+                        }))
+                    listings = await scrape_with_traditional_method(site_url, area)
+            
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "progress",
+                    "message": f"AI found {len(listings)} listings in {area}",
+                    "progress": 95
+                }))
+                
+    except Exception as e:
+        if websocket:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"AI scraping failed for {area}: {str(e)}, using fallback"
+            }))
+        listings = await scrape_buyrentkenya_fallback(area)
+    
+    return listings
+
+async def scrape_with_traditional_method(site_url: str, area: str) -> List[HousingListing]:
+    """Traditional scraping fallback when AI extraction fails"""
+    listings = []
     
     try:
         ua = UserAgent()
@@ -261,27 +409,10 @@ async def ai_scrape_housing_site(site_url: str, area: str, websocket: WebSocket 
                 viewport={'width': 1920, 'height': 1080}
             )
             page = await context.new_page()
-            
-            if websocket:
-                await websocket.send_text(json.dumps({
-                    "type": "progress", 
-                    "message": f"Loading page for {area}...",
-                    "progress": 30
-                }))
-            
             await page.goto(site_url, wait_until='networkidle', timeout=30000)
-            
-            if websocket:
-                await websocket.send_text(json.dumps({
-                    "type": "progress", 
-                    "message": f"Extracting listings for {area}...",
-                    "progress": 60
-                }))
-            
             content = await page.content()
             await browser.close()
             
-            # Parse with BeautifulSoup
             soup = BeautifulSoup(content, 'html.parser')
             
             if 'buyrentkenya' in site_url.lower():
@@ -290,21 +421,9 @@ async def ai_scrape_housing_site(site_url: str, area: str, websocket: WebSocket 
                 listings = await extract_pigiame_listings(soup, area)
             else:
                 listings = await extract_generic_listings(soup, area, site_url)
-            
-            if websocket:
-                await websocket.send_text(json.dumps({
-                    "type": "progress",
-                    "message": f"Found {len(listings)} listings in {area}",
-                    "progress": 90
-                }))
                 
     except Exception as e:
-        if websocket:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"Enhanced scraping failed for {area}: {str(e)}"
-            }))
-        listings = await scrape_buyrentkenya_fallback(area)
+        print(f"Traditional scraping also failed: {str(e)}")
     
     return listings
 
@@ -615,20 +734,28 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.post("/scrape-listings-ai", response_model=List[HousingListing])
 async def scrape_housing_listings_ai(request: HousingListingRequest):
-    """AI-powered scraping with progress tracking"""
+    """AI-powered scraping with progress tracking and user-configurable API keys"""
     try:
         all_listings = []
+        
+        effective_api_key = request.api_key or OPENAI_API_KEY
+        if not effective_api_key and not USE_LOCAL_LLM:
+            raise HTTPException(
+                status_code=400, 
+                detail="AI scraping requires an API key. Please provide your OpenAI API key."
+            )
         
         sites_to_scrape = []
         for area in request.areas:
             sites_to_scrape.extend([
                 f"https://www.buyrentkenya.com/houses-for-rent/{area.lower().replace(' ', '-')}",
-                f"https://www.pigiame.co.ke/houses-apartments-for-rent/{area.lower().replace(' ', '-')}"
+                f"https://www.pigiame.co.ke/houses-apartments-for-rent/{area.lower().replace(' ', '-')}",
+                f"https://www.jiji.co.ke/houses-apartments-for-rent/{area.lower().replace(' ', '-')}"
             ])
         
         for site_url in sites_to_scrape:
-            area = request.areas[sites_to_scrape.index(site_url) // 2]
-            listings = await ai_scrape_housing_site(site_url, area)
+            area = request.areas[sites_to_scrape.index(site_url) // 3]
+            listings = await ai_scrape_housing_site(site_url, area, request.api_key)
             all_listings.extend(listings)
         
         filtered_listings = []
@@ -644,11 +771,30 @@ async def scrape_housing_listings_ai(request: HousingListingRequest):
             
             filtered_listings.append(listing)
         
-        filtered_listings.sort(key=lambda x: x.price or 0)
-        return filtered_listings[:50]
+        seen = set()
+        unique_listings = []
+        for listing in filtered_listings:
+            key = (listing.title.lower(), listing.price, listing.location.lower())
+            if key not in seen:
+                seen.add(key)
+                unique_listings.append(listing)
+        
+        unique_listings.sort(key=lambda x: x.price or 0)
+        return unique_listings[:50]
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI scraping failed: {str(e)}")
+
+@app.get("/ai-config-status")
+async def get_ai_config_status():
+    """Check AI configuration status"""
+    return {
+        "openai_configured": bool(OPENAI_API_KEY),
+        "local_llm_enabled": USE_LOCAL_LLM,
+        "ollama_url": OLLAMA_BASE_URL if USE_LOCAL_LLM else None,
+        "max_listings": MAX_LISTINGS_PER_SITE,
+        "timeout": SCRAPING_TIMEOUT
+    }
 
 @app.post("/scrape-listings", response_model=List[HousingListing])
 async def scrape_housing_listings(request: HousingListingRequest):
