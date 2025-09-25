@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { MapContainer, TileLayer, Marker, Popup, Polygon, useMap } from 'react-leaflet'
 import { LatLngExpression } from 'leaflet'
-import { Search, MapPin, Clock, Car, Home, Calendar } from 'lucide-react'
+import { Search, MapPin, Clock, Car, Home, Calendar, DollarSign, Building, Bed } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -32,6 +32,20 @@ interface NamedArea {
   description: string
 }
 
+interface HousingListing {
+  title: string
+  price: number | null
+  location: string
+  area: string
+  bedrooms: number | null
+  property_type: string
+  description: string
+  contact: string | null
+  url: string
+  source: string
+  images: string[]
+}
+
 function MapUpdater({ center, zoom }: { center: LatLngExpression, zoom: number }) {
   const map = useMap()
   
@@ -52,7 +66,13 @@ function App() {
   const [workEndTime, setWorkEndTime] = useState<string>('17:00')
   const [isochrone, setIsochrone] = useState<IsochronePoint[]>([])
   const [suggestedAreas, setSuggestedAreas] = useState<NamedArea[]>([])
+  const [minBudget, setMinBudget] = useState<number[]>([10000])
+  const [maxBudget, setMaxBudget] = useState<number[]>([100000])
+  const [propertyType, setPropertyType] = useState<string>('any')
+  const [bedrooms, setBedrooms] = useState<string>('any')
+  const [housingListings, setHousingListings] = useState<HousingListing[]>([])
   const [isLoading, setIsLoading] = useState<boolean>(false)
+  const [isScrapingListings, setIsScrapingListings] = useState<boolean>(false)
   const [mapCenter, setMapCenter] = useState<LatLngExpression>([-1.2921, 36.8219])
   const [mapZoom, setMapZoom] = useState<number>(7)
   const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -190,6 +210,38 @@ function App() {
     }
   }
 
+  const scrapeHousingListings = async () => {
+    if (suggestedAreas.length === 0) return
+
+    setIsScrapingListings(true)
+    try {
+      const areaNames = suggestedAreas.map(area => area.name)
+      
+      const response = await fetch(`${API_BASE_URL}/scrape-listings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          areas: areaNames,
+          min_budget: minBudget[0],
+          max_budget: maxBudget[0],
+          property_type: propertyType,
+          bedrooms: bedrooms === 'any' ? null : parseInt(bedrooms)
+        }),
+      })
+
+      if (response.ok) {
+        const listings = await response.json()
+        setHousingListings(listings)
+      }
+    } catch (error) {
+      console.error('Housing listing scraping failed:', error)
+    } finally {
+      setIsScrapingListings(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="container mx-auto p-4">
@@ -202,7 +254,7 @@ function App() {
           </p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-1">
             <Card>
               <CardHeader>
@@ -315,32 +367,115 @@ function App() {
                     </Button>
 
                     {suggestedAreas.length > 0 && (
-                      <div className="space-y-2 pt-4 border-t">
-                        <Label className="flex items-center gap-2">
-                          <Home className="h-4 w-4" />
-                          Suggested Areas ({suggestedAreas.length})
-                        </Label>
-                        <div className="max-h-48 overflow-y-auto space-y-2">
-                          {suggestedAreas.map((area) => (
-                            <div
-                              key={area.name}
-                              className="p-3 border rounded-lg hover:bg-gray-50 cursor-pointer"
-                              onClick={() => {
-                                setMapCenter([area.lat, area.lng])
-                                setMapZoom(13)
-                              }}
-                            >
-                              <div className="flex justify-between items-start">
-                                <div>
-                                  <h4 className="font-medium text-sm">{area.name}</h4>
-                                  <p className="text-xs text-gray-500 mt-1">{area.description}</p>
+                      <div className="space-y-4 pt-4 border-t">
+                        <div className="space-y-2">
+                          <Label className="flex items-center gap-2">
+                            <Home className="h-4 w-4" />
+                            Suggested Areas ({suggestedAreas.length})
+                          </Label>
+                          <div className="max-h-32 overflow-y-auto space-y-2">
+                            {suggestedAreas.map((area) => (
+                              <div
+                                key={area.name}
+                                className="p-2 border rounded-lg hover:bg-gray-50 cursor-pointer"
+                                onClick={() => {
+                                  setMapCenter([area.lat, area.lng])
+                                  setMapZoom(13)
+                                }}
+                              >
+                                <div className="flex justify-between items-start">
+                                  <div>
+                                    <h4 className="font-medium text-xs">{area.name}</h4>
+                                    <p className="text-xs text-gray-500 mt-1 truncate">{area.description}</p>
+                                  </div>
+                                  <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">
+                                    {area.commute_time_minutes}min
+                                  </span>
                                 </div>
-                                <span className="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded">
-                                  {area.commute_time_minutes}min
-                                </span>
                               </div>
-                            </div>
-                          ))}
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="space-y-4 pt-4 border-t">
+                          <Label className="flex items-center gap-2">
+                            <DollarSign className="h-4 w-4" />
+                            Budget Range (KSh)
+                          </Label>
+                          
+                          <div className="space-y-2">
+                            <Label className="text-xs text-gray-500">
+                              Min Budget: KSh {minBudget[0].toLocaleString()}
+                            </Label>
+                            <Slider
+                              value={minBudget}
+                              onValueChange={setMinBudget}
+                              max={200000}
+                              min={5000}
+                              step={5000}
+                              className="w-full"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label className="text-xs text-gray-500">
+                              Max Budget: KSh {maxBudget[0].toLocaleString()}
+                            </Label>
+                            <Slider
+                              value={maxBudget}
+                              onValueChange={setMaxBudget}
+                              max={500000}
+                              min={10000}
+                              step={10000}
+                              className="w-full"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label className="flex items-center gap-2">
+                              <Building className="h-4 w-4" />
+                              Property Type
+                            </Label>
+                            <Select value={propertyType} onValueChange={setPropertyType}>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="any">Any</SelectItem>
+                                <SelectItem value="apartment">Apartment</SelectItem>
+                                <SelectItem value="house">House</SelectItem>
+                                <SelectItem value="studio">Studio</SelectItem>
+                                <SelectItem value="villa">Villa</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label className="flex items-center gap-2">
+                              <Bed className="h-4 w-4" />
+                              Bedrooms
+                            </Label>
+                            <Select value={bedrooms} onValueChange={setBedrooms}>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="any">Any</SelectItem>
+                                <SelectItem value="1">1 Bedroom</SelectItem>
+                                <SelectItem value="2">2 Bedrooms</SelectItem>
+                                <SelectItem value="3">3 Bedrooms</SelectItem>
+                                <SelectItem value="4">4+ Bedrooms</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <Button 
+                            onClick={scrapeHousingListings} 
+                            disabled={isScrapingListings} 
+                            className="w-full"
+                          >
+                            {isScrapingListings ? 'Finding Listings...' : 'Find Housing Listings'}
+                          </Button>
                         </div>
                       </div>
                     )}
@@ -350,7 +485,7 @@ function App() {
             </Card>
           </div>
 
-          <div className="lg:col-span-3">
+          <div className="lg:col-span-2 space-y-6">
             <Card>
               <CardHeader>
                 <CardTitle>Map View</CardTitle>
@@ -427,6 +562,68 @@ function App() {
                 </div>
               </CardContent>
             </Card>
+
+            {housingListings.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Housing Listings ({housingListings.length})</CardTitle>
+                  <CardDescription>
+                    Available properties in your preferred areas within budget
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="max-h-96 overflow-y-auto space-y-3">
+                    {housingListings.map((listing, index) => (
+                      <div key={index} className="border rounded-lg p-4 hover:bg-gray-50">
+                        <div className="flex justify-between items-start mb-2">
+                          <h4 className="font-medium text-sm line-clamp-2">{listing.title}</h4>
+                          <div className="text-right">
+                            {listing.price && (
+                              <span className="font-bold text-green-600">
+                                KSh {listing.price.toLocaleString()}
+                              </span>
+                            )}
+                            <div className="text-xs text-gray-500 mt-1">{listing.source}</div>
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-4 text-xs text-gray-600 mb-2">
+                          <span className="flex items-center gap-1">
+                            <MapPin className="h-3 w-3" />
+                            {listing.area}
+                          </span>
+                          {listing.bedrooms && (
+                            <span className="flex items-center gap-1">
+                              <Bed className="h-3 w-3" />
+                              {listing.bedrooms} bed{listing.bedrooms > 1 ? 's' : ''}
+                            </span>
+                          )}
+                          <span className="flex items-center gap-1">
+                            <Building className="h-3 w-3" />
+                            {listing.property_type}
+                          </span>
+                        </div>
+                        
+                        <p className="text-xs text-gray-700 mb-3 line-clamp-2">
+                          {listing.description}
+                        </p>
+                        
+                        {listing.url && (
+                          <Button 
+                            variant="outline" 
+                            size="sm" 
+                            onClick={() => window.open(listing.url, '_blank')}
+                            className="text-xs"
+                          >
+                            View Details
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
           </div>
         </div>
       </div>

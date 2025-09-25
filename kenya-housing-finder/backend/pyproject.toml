@@ -15,6 +15,8 @@ folium = "^0.20.0"
 osmnx = "^2.0.6"
 networkx = "^3.5"
 python-dateutil = "^2.9.0.post0"
+aiohttp = "^3.9.0"
+beautifulsoup4 = "^4.12.0"
 
 
 [build-system]
