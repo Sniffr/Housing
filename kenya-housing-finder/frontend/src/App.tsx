@@ -1,13 +1,14 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, Marker, Popup, Polygon, useMap } from 'react-leaflet'
 import { LatLngExpression } from 'leaflet'
-import { Search, MapPin, Clock, Car, Home, Calendar, DollarSign, Building, Bed } from 'lucide-react'
+import { Search, MapPin, Clock, Car, Home, Calendar, DollarSign, Building, Bed, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Progress } from '@/components/ui/progress'
 import 'leaflet/dist/leaflet.css'
 import './leaflet-setup'
 import './App.css'
@@ -73,6 +74,10 @@ function App() {
   const [housingListings, setHousingListings] = useState<HousingListing[]>([])
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const [isScrapingListings, setIsScrapingListings] = useState<boolean>(false)
+  const [scrapingProgress, setScrapingProgress] = useState<number>(0)
+  const [scrapingMessage, setScrapingMessage] = useState<string>('')
+  const [scrapingErrors, setScrapingErrors] = useState<string[]>([])
+  const wsRef = useRef<WebSocket | null>(null)
   const [mapCenter, setMapCenter] = useState<LatLngExpression>([-1.2921, 36.8219])
   const [mapZoom, setMapZoom] = useState<number>(7)
   const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -210,14 +215,32 @@ function App() {
     }
   }
 
-  const scrapeHousingListings = async () => {
+  const scrapeHousingListingsAI = async () => {
     if (suggestedAreas.length === 0) return
 
     setIsScrapingListings(true)
+    setScrapingProgress(0)
+    setScrapingMessage('Initializing AI scraping...')
+    setScrapingErrors([])
+    setHousingListings([])
+
     try {
+      const wsUrl = API_BASE_URL.replace('http', 'ws') + '/ws/scraping-progress'
+      wsRef.current = new WebSocket(wsUrl)
+      
+      wsRef.current.onmessage = (event) => {
+        const data = JSON.parse(event.data)
+        if (data.type === 'progress') {
+          setScrapingProgress(data.progress)
+          setScrapingMessage(data.message)
+        } else if (data.type === 'error') {
+          setScrapingErrors(prev => [...prev, data.message])
+        }
+      }
+
       const areaNames = suggestedAreas.map(area => area.name)
       
-      const response = await fetch(`${API_BASE_URL}/scrape-listings`, {
+      const response = await fetch(`${API_BASE_URL}/scrape-listings-ai`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -234,11 +257,17 @@ function App() {
       if (response.ok) {
         const listings = await response.json()
         setHousingListings(listings)
+        setScrapingMessage(`Found ${listings.length} listings using AI scraping!`)
+        setScrapingProgress(100)
       }
     } catch (error) {
-      console.error('Housing listing scraping failed:', error)
+      console.error('AI Housing listing scraping failed:', error)
+      setScrapingErrors(prev => [...prev, 'AI scraping failed: ' + (error instanceof Error ? error.message : String(error))])
     } finally {
       setIsScrapingListings(false)
+      if (wsRef.current) {
+        wsRef.current.close()
+      }
     }
   }
 
@@ -470,12 +499,33 @@ function App() {
                           </div>
 
                           <Button 
-                            onClick={scrapeHousingListings} 
+                            onClick={scrapeHousingListingsAI} 
                             disabled={isScrapingListings} 
                             className="w-full"
                           >
-                            {isScrapingListings ? 'Finding Listings...' : 'Find Housing Listings'}
+                            {isScrapingListings ? (
+                              <>
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                AI Scraping...
+                              </>
+                            ) : (
+                              'Find Housing Listings (AI-Powered)'
+                            )}
                           </Button>
+
+                          {isScrapingListings && (
+                            <div className="mt-4 space-y-2">
+                              <Progress value={scrapingProgress} className="w-full" />
+                              <p className="text-sm text-gray-600">{scrapingMessage}</p>
+                              {scrapingErrors.length > 0 && (
+                                <div className="text-sm text-red-600">
+                                  {scrapingErrors.map((error, index) => (
+                                    <p key={index}>{error}</p>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                     )}

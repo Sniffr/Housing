@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import requests
 import json
 from geopy.distance import geodesic
@@ -12,6 +12,8 @@ import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
 import re
+from playwright.async_api import async_playwright
+from fake_useragent import UserAgent
 
 app = FastAPI(title="Kenya Housing Location Finder API")
 
@@ -237,8 +239,261 @@ async def suggest_areas(request: CommuteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Area suggestion failed: {str(e)}")
 
-async def scrape_buyrentkenya(session: aiohttp.ClientSession, area: str, max_budget: Optional[int] = None) -> List[HousingListing]:
-    """Scrape housing listings from BuyRentKenya"""
+async def ai_scrape_housing_site(site_url: str, area: str, websocket: WebSocket = None) -> List[HousingListing]:
+    """Enhanced scraping using Playwright + BeautifulSoup with intelligent extraction"""
+    listings = []
+    
+    if websocket:
+        await websocket.send_text(json.dumps({
+            "type": "progress",
+            "message": f"Starting enhanced scraping for {area}...",
+            "site": site_url,
+            "progress": 10
+        }))
+    
+    try:
+        ua = UserAgent()
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=ua.random,
+                viewport={'width': 1920, 'height': 1080}
+            )
+            page = await context.new_page()
+            
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "progress", 
+                    "message": f"Loading page for {area}...",
+                    "progress": 30
+                }))
+            
+            await page.goto(site_url, wait_until='networkidle', timeout=30000)
+            
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "progress", 
+                    "message": f"Extracting listings for {area}...",
+                    "progress": 60
+                }))
+            
+            content = await page.content()
+            await browser.close()
+            
+            # Parse with BeautifulSoup
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            if 'buyrentkenya' in site_url.lower():
+                listings = await extract_buyrentkenya_listings(soup, area)
+            elif 'pigiame' in site_url.lower() or 'jiji' in site_url.lower():
+                listings = await extract_pigiame_listings(soup, area)
+            else:
+                listings = await extract_generic_listings(soup, area, site_url)
+            
+            if websocket:
+                await websocket.send_text(json.dumps({
+                    "type": "progress",
+                    "message": f"Found {len(listings)} listings in {area}",
+                    "progress": 90
+                }))
+                
+    except Exception as e:
+        if websocket:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Enhanced scraping failed for {area}: {str(e)}"
+            }))
+        listings = await scrape_buyrentkenya_fallback(area)
+    
+    return listings
+
+async def extract_buyrentkenya_listings(soup: BeautifulSoup, area: str) -> List[HousingListing]:
+    """Extract listings from BuyRentKenya with enhanced selectors"""
+    listings = []
+    
+    listing_selectors = [
+        '.property-item', '.listing-item', '.property-card', 
+        '.search-result-item', '.property-listing', '[data-property-id]'
+    ]
+    
+    listing_elements = []
+    for selector in listing_selectors:
+        elements = soup.select(selector)
+        if elements:
+            listing_elements = elements
+            break
+    
+    for element in listing_elements[:20]:  # Limit to 20 listings
+        try:
+            title_selectors = ['.property-title', '.listing-title', 'h3', 'h4', '.title']
+            title = "No title"
+            for sel in title_selectors:
+                title_elem = element.select_one(sel)
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+                    break
+            
+            price_selectors = ['.price', '.property-price', '.listing-price', '[class*="price"]']
+            price_text = ""
+            for sel in price_selectors:
+                price_elem = element.select_one(sel)
+                if price_elem:
+                    price_text = price_elem.get_text(strip=True)
+                    break
+            
+            location_selectors = ['.location', '.property-location', '.address', '[class*="location"]']
+            location = area
+            for sel in location_selectors:
+                loc_elem = element.select_one(sel)
+                if loc_elem:
+                    location = loc_elem.get_text(strip=True)
+                    break
+            
+            url = ""
+            link_elem = element.select_one('a[href]')
+            if link_elem:
+                url = link_elem.get('href', '')
+                if url.startswith('/'):
+                    url = 'https://www.buyrentkenya.com' + url
+            
+            # Extract description
+            desc_selectors = ['.description', '.property-description', '.summary', 'p']
+            description = "No description"
+            for sel in desc_selectors:
+                desc_elem = element.select_one(sel)
+                if desc_elem:
+                    description = desc_elem.get_text(strip=True)[:200]
+                    break
+            
+            listing = HousingListing(
+                title=title,
+                price=extract_price(price_text),
+                location=location,
+                area=area,
+                bedrooms=extract_bedrooms(title + " " + description),
+                property_type=extract_property_type(title + " " + description),
+                description=description,
+                contact=None,
+                url=url,
+                source="Enhanced Playwright Scraping",
+                images=[]
+            )
+            listings.append(listing)
+            
+        except Exception as e:
+            continue
+    
+    return listings
+
+async def extract_pigiame_listings(soup: BeautifulSoup, area: str) -> List[HousingListing]:
+    """Extract listings from PigiaMe/Jiji with enhanced selectors"""
+    listings = []
+    
+    listing_selectors = [
+        '.listing', '.ad-item', '.product-item', 
+        '[data-ad-id]', '.search-item', '.classified-item'
+    ]
+    
+    listing_elements = []
+    for selector in listing_selectors:
+        elements = soup.select(selector)
+        if elements:
+            listing_elements = elements
+            break
+    
+    for element in listing_elements[:20]:
+        try:
+            title_selectors = ['.ad-title', '.listing-title', 'h3', 'h4', '.title', 'a[title]']
+            title = "No title"
+            for sel in title_selectors:
+                title_elem = element.select_one(sel)
+                if title_elem:
+                    title = title_elem.get_text(strip=True) or title_elem.get('title', '')
+                    break
+            
+            price_selectors = ['.price', '.ad-price', '.listing-price', '[class*="price"]']
+            price_text = ""
+            for sel in price_selectors:
+                price_elem = element.select_one(sel)
+                if price_elem:
+                    price_text = price_elem.get_text(strip=True)
+                    break
+            
+            location_selectors = ['.location', '.ad-location', '.region', '[class*="location"]']
+            location = area
+            for sel in location_selectors:
+                loc_elem = element.select_one(sel)
+                if loc_elem:
+                    location = loc_elem.get_text(strip=True)
+                    break
+            
+            url = ""
+            link_elem = element.select_one('a[href]')
+            if link_elem:
+                url = link_elem.get('href', '')
+                if url.startswith('/'):
+                    url = 'https://www.pigiame.co.ke' + url
+            
+            listing = HousingListing(
+                title=title,
+                price=extract_price(price_text),
+                location=location,
+                area=area,
+                bedrooms=extract_bedrooms(title),
+                property_type=extract_property_type(title),
+                description=title,
+                contact=None,
+                url=url,
+                source="Enhanced Playwright Scraping",
+                images=[]
+            )
+            listings.append(listing)
+            
+        except Exception as e:
+            continue
+    
+    return listings
+
+async def extract_generic_listings(soup: BeautifulSoup, area: str, site_url: str) -> List[HousingListing]:
+    """Generic extraction for unknown sites"""
+    listings = []
+    
+    potential_listings = soup.find_all(['div', 'article', 'section'], 
+                                     class_=re.compile(r'(listing|property|ad|item|card)', re.I))
+    
+    for element in potential_listings[:15]:
+        try:
+            title_elem = element.find(['h1', 'h2', 'h3', 'h4', 'h5'])
+            title = title_elem.get_text(strip=True) if title_elem else "Property Listing"
+            
+            price_text = ""
+            price_elem = element.find(text=re.compile(r'KSh|Ksh|ksh|\d+,?\d*'))
+            if price_elem:
+                price_text = str(price_elem).strip()
+            
+            listing = HousingListing(
+                title=title,
+                price=extract_price(price_text),
+                location=area,
+                area=area,
+                bedrooms=extract_bedrooms(title),
+                property_type=extract_property_type(title),
+                description=title,
+                contact=None,
+                url=site_url,
+                source="Generic Enhanced Scraping",
+                images=[]
+            )
+            listings.append(listing)
+            
+        except Exception as e:
+            continue
+    
+    return listings
+
+async def scrape_buyrentkenya_fallback(area: str) -> List[HousingListing]:
+    """Fallback scraping using BeautifulSoup"""
     listings = []
     try:
         search_url = f"https://www.buyrentkenya.com/houses-for-rent/{area.lower().replace(' ', '-')}"
@@ -247,121 +502,55 @@ async def scrape_buyrentkenya(session: aiohttp.ClientSession, area: str, max_bud
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         
-        async with session.get(search_url, headers=headers) as response:
-            if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                property_cards = soup.find_all('div', class_=['property-card', 'listing-item', 'property-item'])
-                
-                for card in property_cards[:10]:  # Limit to 10 listings per area
-                    try:
-                        title_elem = card.find(['h3', 'h4', 'h2'], class_=['title', 'property-title'])
-                        title = title_elem.get_text(strip=True) if title_elem else "No title"
-                        
-                        price_elem = card.find(['span', 'div'], class_=['price', 'amount'])
-                        price_text = price_elem.get_text(strip=True) if price_elem else "0"
-                        price = extract_price(price_text)
-                        
-                        if max_budget and price and price > max_budget:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    property_cards = soup.find_all('div', class_=['property-card', 'listing-item', 'property-item'])
+                    
+                    for card in property_cards[:5]:
+                        try:
+                            title_elem = card.find(['h3', 'h4', 'h2'], class_=['title', 'property-title'])
+                            title = title_elem.get_text(strip=True) if title_elem else "No title"
+                            
+                            price_elem = card.find(['span', 'div'], class_=['price', 'amount'])
+                            price_text = price_elem.get_text(strip=True) if price_elem else "0"
+                            price = extract_price(price_text)
+                            
+                            location_elem = card.find(['span', 'div'], class_=['location', 'address'])
+                            location = location_elem.get_text(strip=True) if location_elem else area
+                            
+                            desc_elem = card.find(['p', 'div'], class_=['description', 'excerpt'])
+                            description = desc_elem.get_text(strip=True) if desc_elem else "No description"
+                            
+                            link_elem = card.find('a', href=True)
+                            url = link_elem['href'] if link_elem else ""
+                            if url and not url.startswith('http'):
+                                url = f"https://www.buyrentkenya.com{url}"
+                            
+                            bedrooms = extract_bedrooms(title + " " + description)
+                            property_type = extract_property_type(title + " " + description)
+                            
+                            listings.append(HousingListing(
+                                title=title,
+                                price=price,
+                                location=location,
+                                area=area,
+                                bedrooms=bedrooms,
+                                property_type=property_type,
+                                description=description[:200] + "..." if len(description) > 200 else description,
+                                contact=None,
+                                url=url,
+                                source="Fallback Scraping",
+                                images=[]
+                            ))
+                        except Exception as e:
                             continue
-                        
-                        location_elem = card.find(['span', 'div'], class_=['location', 'address'])
-                        location = location_elem.get_text(strip=True) if location_elem else area
-                        
-                        desc_elem = card.find(['p', 'div'], class_=['description', 'excerpt'])
-                        description = desc_elem.get_text(strip=True) if desc_elem else "No description"
-                        
-                        link_elem = card.find('a', href=True)
-                        url = link_elem['href'] if link_elem else ""
-                        if url and not url.startswith('http'):
-                            url = f"https://www.buyrentkenya.com{url}"
-                        
-                        bedrooms = extract_bedrooms(title + " " + description)
-                        property_type = extract_property_type(title + " " + description)
-                        
-                        listings.append(HousingListing(
-                            title=title,
-                            price=price,
-                            location=location,
-                            area=area,
-                            bedrooms=bedrooms,
-                            property_type=property_type,
-                            description=description[:200] + "..." if len(description) > 200 else description,
-                            contact=None,
-                            url=url,
-                            source="BuyRentKenya",
-                            images=[]
-                        ))
-                    except Exception as e:
-                        continue
-                        
+                            
     except Exception as e:
-        print(f"Error scraping BuyRentKenya for {area}: {str(e)}")
-    
-    return listings
-
-async def scrape_pigikenya(session: aiohttp.ClientSession, area: str, max_budget: Optional[int] = None) -> List[HousingListing]:
-    """Scrape housing listings from PigiaKenya"""
-    listings = []
-    try:
-        search_url = f"https://www.pigiame.co.ke/houses-apartments-for-rent/{area.lower().replace(' ', '-')}"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        async with session.get(search_url, headers=headers) as response:
-            if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                property_cards = soup.find_all('div', class_=['listing-card', 'ad-item', 'property-listing'])
-                
-                for card in property_cards[:10]:  # Limit to 10 listings per area
-                    try:
-                        title_elem = card.find(['h3', 'h4', 'h2'])
-                        title = title_elem.get_text(strip=True) if title_elem else "No title"
-                        
-                        price_elem = card.find(['span', 'div'], string=re.compile(r'KSh|Ksh|ksh'))
-                        price_text = price_elem.get_text(strip=True) if price_elem else "0"
-                        price = extract_price(price_text)
-                        
-                        if max_budget and price and price > max_budget:
-                            continue
-                        
-                        location_elem = card.find(['span', 'div'], class_=['location'])
-                        location = location_elem.get_text(strip=True) if location_elem else area
-                        
-                        desc_elem = card.find(['p', 'div'], class_=['description'])
-                        description = desc_elem.get_text(strip=True) if desc_elem else "No description"
-                        
-                        link_elem = card.find('a', href=True)
-                        url = link_elem['href'] if link_elem else ""
-                        if url and not url.startswith('http'):
-                            url = f"https://www.pigiame.co.ke{url}"
-                        
-                        bedrooms = extract_bedrooms(title + " " + description)
-                        property_type = extract_property_type(title + " " + description)
-                        
-                        listings.append(HousingListing(
-                            title=title,
-                            price=price,
-                            location=location,
-                            area=area,
-                            bedrooms=bedrooms,
-                            property_type=property_type,
-                            description=description[:200] + "..." if len(description) > 200 else description,
-                            contact=None,
-                            url=url,
-                            source="PigiaKenya",
-                            images=[]
-                        ))
-                    except Exception as e:
-                        continue
-                        
-    except Exception as e:
-        print(f"Error scraping PigiaKenya for {area}: {str(e)}")
+        print(f"Error in fallback scraping for {area}: {str(e)}")
     
     return listings
 
@@ -415,24 +604,32 @@ def extract_property_type(text: str) -> str:
     else:
         return 'apartment'
 
-@app.post("/scrape-listings", response_model=List[HousingListing])
-async def scrape_housing_listings(request: HousingListingRequest):
-    """Scrape housing listings from multiple sources for specified areas"""
+@app.websocket("/ws/scraping-progress")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        pass
+
+@app.post("/scrape-listings-ai", response_model=List[HousingListing])
+async def scrape_housing_listings_ai(request: HousingListingRequest):
+    """AI-powered scraping with progress tracking"""
     try:
         all_listings = []
         
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            
-            for area in request.areas:
-                tasks.append(scrape_buyrentkenya(session, area, request.max_budget))
-                tasks.append(scrape_pigikenya(session, area, request.max_budget))
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in results:
-                if isinstance(result, list):
-                    all_listings.extend(result)
+        sites_to_scrape = []
+        for area in request.areas:
+            sites_to_scrape.extend([
+                f"https://www.buyrentkenya.com/houses-for-rent/{area.lower().replace(' ', '-')}",
+                f"https://www.pigiame.co.ke/houses-apartments-for-rent/{area.lower().replace(' ', '-')}"
+            ])
+        
+        for site_url in sites_to_scrape:
+            area = request.areas[sites_to_scrape.index(site_url) // 2]
+            listings = await ai_scrape_housing_site(site_url, area)
+            all_listings.extend(listings)
         
         filtered_listings = []
         for listing in all_listings:
@@ -448,11 +645,15 @@ async def scrape_housing_listings(request: HousingListingRequest):
             filtered_listings.append(listing)
         
         filtered_listings.sort(key=lambda x: x.price or 0)
+        return filtered_listings[:50]
         
-        return filtered_listings[:50]  # Return top 50 results
-    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Listing scraping failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI scraping failed: {str(e)}")
+
+@app.post("/scrape-listings", response_model=List[HousingListing])
+async def scrape_housing_listings(request: HousingListingRequest):
+    """Legacy scraping endpoint for backward compatibility"""
+    return await scrape_housing_listings_ai(request)
 
 @app.get("/health")
 def health_check():
